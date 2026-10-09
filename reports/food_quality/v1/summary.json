@@ -1,0 +1,74 @@
+{
+  "audit_version": "1.0",
+  "source_sha256": "696036851f95fa11d0a381ccd752afc1aa8a3ecca54a1fd0cf0279ac57a3ebe7",
+  "record_count": 99,
+  "column_count": 13,
+  "columns": [
+    "Food_items",
+    "Category",
+    "Calories",
+    "Fats",
+    "Protein",
+    "Iron",
+    "Carbohydrates",
+    "Fibre",
+    "Sugar",
+    "Meal_Type",
+    "Sodium",
+    "Vegetarian",
+    "Vegan"
+  ],
+  "rule_counts": {
+    "ENERGY_449_DEVIATION": 74,
+    "ENERGY_FIBRE_SCREEN": 72,
+    "FAT_ENERGY_GT_CALORIES": 24,
+    "FIBRE_GT_CARBS": 6,
+    "SUGAR_GT_CARBS": 36,
+    "UNKNOWN_PROVENANCE_AND_BASIS": 99
+  },
+  "missing_counts": {
+    "Food_items": 0,
+    "Category": 0,
+    "Calories": 0,
+    "Fats": 0,
+    "Protein": 0,
+    "Iron": 0,
+    "Carbohydrates": 0,
+    "Fibre": 0,
+    "Sugar": 0,
+    "Meal_Type": 0,
+    "Sodium": 0,
+    "Vegetarian": 0,
+    "Vegan": 0
+  },
+  "missing_percent": {
+    "Food_items": 0.0,
+    "Category": 0.0,
+    "Calories": 0.0,
+    "Fats": 0.0,
+    "Protein": 0.0,
+    "Iron": 0.0,
+    "Carbohydrates": 0.0,
+    "Fibre": 0.0,
+    "Sugar": 0.0,
+    "Meal_Type": 0.0,
+    "Sodium": 0.0,
+    "Vegetarian": 0.0,
+    "Vegan": 0.0
+  },
+  "anomaly_count": 311,
+  "records_with_numeric_flags": 86,
+  "review_status": "needs_review",
+  "nutrient_values_modified": false,
+  "not_evaluated": [
+    "saturated_fat: field absent",
+    "absolute nutrition ranges: basis unknown"
+  ],
+  "energy_policy": {
+    "relative_tolerance": "0.2",
+    "absolute_tolerance": "50",
+    "units_assumed_only_for_screening": "kcal and g; NOT verified"
+  },
+  "source_name": "food_data.csv",
+  "source_sha256_after": "696036851f95fa11d0a381ccd752afc1aa8a3ecca54a1fd0cf0279ac57a3ebe7"
+}
