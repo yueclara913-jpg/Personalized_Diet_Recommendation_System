@@ -1,0 +1,22 @@
+{
+  "source_name": "USDA FoodData Central",
+  "source_url": "https://fdc.nal.usda.gov/download-datasets/",
+  "source_data_type": "Foundation",
+  "source_version": "2026-04",
+  "published_at": null,
+  "publication_precision": "month",
+  "license_id": "CC0-1.0",
+  "license_url": "https://fdc.nal.usda.gov/api-guide/",
+  "download_url": "https://fdc.nal.usda.gov/fdc-datasets/FoodData_Central_foundation_food_json_2026-04-30.zip",
+  "downloaded_at": null,
+  "source_file_sha256": null,
+  "parser_version": "1.0.0",
+  "mapping_version": "usda-id-v1",
+  "format": "JSON",
+  "official_reported_zip_size": "459K",
+  "official_reported_uncompressed_size": "6.5M",
+  "acquisition_status": "blocked",
+  "acquisition_error": "CONNECT tunnel failed, response 403",
+  "download_link_status": "Verified from official download page; executor access blocked",
+  "real_data_verified": false
+}
