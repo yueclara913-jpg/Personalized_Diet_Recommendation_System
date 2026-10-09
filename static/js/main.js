@@ -102,6 +102,11 @@ document.addEventListener('DOMContentLoaded', function() {
     function calculateBMI() {
         const weight = parseFloat(weightInput.value);
         const height = parseFloat(heightInput.value);
+
+        if (!(weight > 0 && height > 0)) {
+            showError('Please enter valid weight and height.');
+            return;
+        }
         
         if (weight > 0 && height > 0) {
             fetch('/calculate_bmi', {
@@ -241,6 +246,11 @@ document.addEventListener('DOMContentLoaded', function() {
     // Display meal items for a specific meal type
     function displayMealItems(mealId, items) {
         const container = document.getElementById(mealId);
+
+        if (items.length === 0) {
+            container.textContent = 'No food items available based on your preferences.';
+            return;
+        }
         
         items.forEach(item => {
             const mealItem = document.createElement('div');
