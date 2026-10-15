@@ -14,7 +14,7 @@ from nutrition.auth.admin_auth import (APPLICATION_ID, IDENTITY_ASSURANCE, Authe
     Principal, assign_role, authenticate, authorized_review_decision, bootstrap_admin,
     change_password, create_admin, disable_admin, initialize_auth_database, list_admins,
     open_auth_database, reset_password, verify_auth_database, verify_authorized_review_action)
-from nutrition.auth.rbac import has_permission, require_permission
+from nutrition.auth.rbac import has_permission
 from nutrition.importers.usda_sqlite import import_payload
 from nutrition.review.workflow import history, initialize_review_database, record_decision
 from nutrition.sources.usda_foundation import parse_snapshot
@@ -33,8 +33,7 @@ class AdminAuthTests(unittest.TestCase):
         initialize_auth_database(self.auth)
         self.admin_id = bootstrap_admin(self.auth, "TEST_ONLY_admin", PASSWORD,
                                         datetime(2026, 1, 1, tzinfo=timezone.utc))
-        self.admin = authenticate(self.auth, "TEST_ONLY_admin", PASSWORD,
-                                  datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc))
+        self.admin = authenticate(self.auth, "TEST_ONLY_admin", PASSWORD)
 
     def account(self, username="TEST_ONLY_reviewer", role="nutrition_reviewer"):
         account_id = create_admin(self.auth, self.admin, username, PASSWORD, role)
@@ -99,7 +98,7 @@ class AdminAuthTests(unittest.TestCase):
         self.assertNotIn(PASSWORD.encode(), self.auth.read_bytes())
 
     def test_07_correct_password_authenticates(self):
-        self.assertTrue(authenticate(self.auth, "TEST_ONLY_admin", PASSWORD).authenticated)
+        self.assertEqual(authenticate(self.auth, "TEST_ONLY_admin", PASSWORD).account_id, self.admin_id)
 
     def test_08_wrong_password_is_generic(self):
         with self.assertRaisesRegex(AuthenticationError, "Authentication failed"):
@@ -139,7 +138,8 @@ class AdminAuthTests(unittest.TestCase):
         self.assertFalse(has_permission("system_admin", "invented.permission"))
 
     def test_16_unauthenticated_denied(self):
-        with self.assertRaises(PermissionError): require_permission(None, "audit.read")
+        with self.assertRaises(PermissionError):
+            create_admin(self.auth, None, "TEST_ONLY_none", PASSWORD, "audit_viewer")
 
     def test_17_audit_viewer_is_read_only(self):
         _, viewer = self.account("TEST_ONLY_viewer", "audit_viewer")
@@ -161,7 +161,7 @@ class AdminAuthTests(unittest.TestCase):
 
     def test_21_client_role_forgery_rejected(self):
         _, reviewer = self.account()
-        forged = Principal(reviewer.account_id, reviewer.username, "system_admin")
+        forged = Principal(reviewer.account_id, reviewer.username, "system_admin", reviewer.session_id, reviewer.session_token)
         with self.assertRaises(PermissionError): create_admin(self.auth, forged, "TEST_ONLY_x", PASSWORD, "audit_viewer")
 
     def test_22_last_system_admin_cannot_be_disabled(self):
@@ -173,12 +173,12 @@ class AdminAuthTests(unittest.TestCase):
     def test_24_password_change_invalidates_old_password(self):
         change_password(self.auth, self.admin, PASSWORD, NEW_PASSWORD)
         with self.assertRaises(AuthenticationError): authenticate(self.auth, "TEST_ONLY_admin", PASSWORD)
-        self.assertTrue(authenticate(self.auth, "TEST_ONLY_admin", NEW_PASSWORD).authenticated)
+        self.assertEqual(authenticate(self.auth, "TEST_ONLY_admin", NEW_PASSWORD).account_id, self.admin_id)
 
     def test_25_authorized_password_reset(self):
         account_id, _ = self.account()
         reset_password(self.auth, self.admin, account_id, NEW_PASSWORD)
-        self.assertTrue(authenticate(self.auth, "TEST_ONLY_reviewer", NEW_PASSWORD).authenticated)
+        self.assertEqual(authenticate(self.auth, "TEST_ONLY_reviewer", NEW_PASSWORD).account_id, account_id)
 
     def test_26_unauthorized_password_reset(self):
         account_id, reviewer = self.account()
@@ -299,6 +299,66 @@ class AdminAuthTests(unittest.TestCase):
         output = json.loads(result.stdout)
         self.assertEqual(output["identity_assurance"], IDENTITY_ASSURANCE)
         self.assertNotIn(PASSWORD, result.stdout + result.stderr)
+
+    def test_44_forged_matching_admin_cannot_create_admin(self):
+        forged = Principal(self.admin.account_id, self.admin.username, self.admin.role,
+                           "forged-session", "forged-token")
+        with self.assertRaises(PermissionError):
+            create_admin(self.auth, forged, "TEST_ONLY_created", PASSWORD, "audit_viewer")
+
+    def test_45_forged_matching_admin_cannot_reset_password(self):
+        target_id, _ = self.account()
+        forged = Principal(self.admin.account_id, self.admin.username, self.admin.role,
+                           "forged-session", "forged-token")
+        with self.assertRaises(PermissionError):
+            reset_password(self.auth, forged, target_id, NEW_PASSWORD)
+
+    def test_46_forged_matching_admin_cannot_authorize_review(self):
+        forged = Principal(self.admin.account_id, self.admin.username, self.admin.role,
+                           "forged-session", "forged-token")
+        with self.assertRaises(PermissionError): self.decision(forged)
+        with sqlite3.connect(self.auth) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM authorized_review_actions").fetchone()[0], 0)
+
+    def test_47_forged_matching_reviewer_cannot_authorize_review(self):
+        _, reviewer = self.account()
+        forged = Principal(reviewer.account_id, reviewer.username, reviewer.role,
+                           "forged-session", "forged-token")
+        with self.assertRaises(PermissionError): self.decision(forged)
+        with sqlite3.connect(self.auth) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM authorized_review_actions").fetchone()[0], 0)
+
+    def test_48_password_change_revokes_existing_session(self):
+        old = self.admin
+        change_password(self.auth, old, PASSWORD, NEW_PASSWORD)
+        with self.assertRaises(PermissionError):
+            create_admin(self.auth, old, "TEST_ONLY_after_change", PASSWORD, "audit_viewer")
+
+    def test_49_cross_database_failure_never_creates_authorization(self):
+        _, reviewer = self.account()
+        staging, review, release, provenance = self.integration()
+        with self.assertRaises(ValueError):
+            authorized_review_decision(self.auth, reviewer, review, staging,
+                release_key=release, fdc_id=91, operation_id="TEST_ONLY-failure",
+                event_type="accept_candidate", review_comment="TEST_ONLY", review_reason="TEST_ONLY",
+                provenance_evidence=provenance,
+                authorization_failure_hook=lambda: (_ for _ in ()).throw(ValueError("TEST_ONLY")))
+        with sqlite3.connect(self.auth) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM authorized_review_actions").fetchone()[0], 0)
+        with sqlite3.connect(review) as db:
+            event_id = db.execute("SELECT event_id FROM review_events").fetchone()[0]
+        self.assertFalse(verify_authorized_review_action(self.auth, review, event_id)["valid"])
+
+    def test_50_session_token_is_not_stored_in_plaintext(self):
+        self.assertNotIn(self.admin.session_token.encode(), self.auth.read_bytes())
+        self.assertNotIn(self.admin.session_token, repr(self.admin))
+
+    def test_51_expired_session_cannot_authorize(self):
+        with sqlite3.connect(self.auth) as db:
+            db.execute("UPDATE auth_sessions SET expires_at_utc='2000-01-01T00:00:00.000000Z' WHERE session_id=?",
+                       (self.admin.session_id,))
+        with self.assertRaises(PermissionError):
+            create_admin(self.auth, self.admin, "TEST_ONLY_expired", PASSWORD, "audit_viewer")
 
 
 if __name__ == "__main__":

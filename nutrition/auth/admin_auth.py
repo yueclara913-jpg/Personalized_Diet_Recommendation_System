@@ -1,16 +1,17 @@
 """Isolated SQLite administrator authentication and authorized review adapter."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import uuid
 
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from nutrition.auth.rbac import ROLES, require_permission
+from nutrition.auth.rbac import ROLES, has_permission
 from nutrition.review.policy import DEFAULT_POLICY
 from nutrition.review.workflow import canonical, record_decision
 
@@ -20,6 +21,7 @@ PASSWORD_METHOD = "pbkdf2:sha256:260000"
 IDENTITY_ASSURANCE = "authenticated_admin_db_v1"
 MAX_FAILURES = 5
 LOCK_MINUTES = 5
+SESSION_MINUTES = 10
 USERNAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,63}")
 
 
@@ -32,7 +34,8 @@ class Principal:
     account_id: str
     username: str
     role: str
-    authenticated: bool = True
+    session_id: str
+    session_token: str = field(repr=False)
 
 
 DDL = (
@@ -42,7 +45,11 @@ DDL = (
     "CHECK(role IN ('system_admin','nutrition_reviewer','audit_viewer')),"
     "status TEXT NOT NULL CHECK(status IN ('active','disabled')),created_at_utc TEXT NOT NULL,"
     "last_login_at_utc TEXT,password_changed_at_utc TEXT NOT NULL,failed_attempts INTEGER NOT NULL DEFAULT 0 "
-    "CHECK(failed_attempts>=0),locked_until_utc TEXT)",
+    "CHECK(failed_attempts>=0),locked_until_utc TEXT,auth_version INTEGER NOT NULL DEFAULT 1 CHECK(auth_version>0))",
+    "CREATE TABLE auth_sessions ("
+    "session_id TEXT PRIMARY KEY,account_id TEXT NOT NULL REFERENCES admin_accounts(account_id),"
+    "token_sha256 TEXT NOT NULL UNIQUE CHECK(length(token_sha256)=64),auth_version INTEGER NOT NULL CHECK(auth_version>0),"
+    "issued_at_utc TEXT NOT NULL,expires_at_utc TEXT NOT NULL,revoked_at_utc TEXT)",
     "CREATE TABLE security_events ("
     "sequence INTEGER PRIMARY KEY,event_id TEXT NOT NULL UNIQUE,event_type TEXT NOT NULL,"
     "actor_account_id TEXT,target_account_id TEXT,details_json TEXT NOT NULL,created_at_utc TEXT NOT NULL,"
@@ -198,9 +205,9 @@ def bootstrap_admin(path, username, password, now=None):
             raise PermissionError("Bootstrap is only available for the first administrator")
         account_id, timestamp = str(uuid.uuid4()), _utc(now)
         password_hash = generate_password_hash(password, method=PASSWORD_METHOD)
-        connection.execute("INSERT INTO admin_accounts VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        connection.execute("INSERT INTO admin_accounts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                            (account_id, username, password_hash, PASSWORD_METHOD, "system_admin", "active",
-                            timestamp, None, timestamp, 0, None))
+                            timestamp, None, timestamp, 0, None, 1))
         _append_event(connection, "admin.bootstrap", account_id, account_id,
                       {"role": "system_admin", "identity_assurance": "bootstrap_local_cli"}, now)
         connection.commit()
@@ -221,7 +228,7 @@ def authenticate(path, username, password, now=None):
     try:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
-            "SELECT account_id,username,password_hash,role,status,failed_attempts,locked_until_utc,password_method "
+            "SELECT account_id,username,password_hash,role,status,failed_attempts,locked_until_utc,password_method,auth_version "
             "FROM admin_accounts WHERE username=? COLLATE NOCASE", (username,)).fetchone()
         # A dummy hash keeps missing-account verification on the same code path.
         stored = row[2] if row else generate_password_hash("dummy-not-a-valid-password", method=PASSWORD_METHOD)
@@ -243,9 +250,15 @@ def authenticate(path, username, password, now=None):
             raise AuthenticationError("Authentication failed")
         connection.execute("UPDATE admin_accounts SET failed_attempts=0,locked_until_utc=NULL,last_login_at_utc=? WHERE account_id=?",
                            (_utc(current), row[0]))
+        session_id = str(uuid.uuid4())
+        session_token = secrets.token_urlsafe(32)
+        token_sha = hashlib.sha256(session_token.encode("utf-8")).hexdigest()
+        connection.execute("INSERT INTO auth_sessions VALUES (?,?,?,?,?,?,NULL)",
+                           (session_id, row[0], token_sha, row[8], _utc(current),
+                            _utc(current + timedelta(minutes=SESSION_MINUTES))))
         _append_event(connection, "auth.success", row[0], row[0], {"role": row[3]}, current)
         connection.commit()
-        return Principal(row[0], row[1], row[3])
+        return Principal(row[0], row[1], row[3], session_id, session_token)
     except AuthenticationError:
         raise
     except BaseException:
@@ -255,29 +268,42 @@ def authenticate(path, username, password, now=None):
         connection.close()
 
 
-def _active_account(connection, principal):
-    if not isinstance(principal, Principal) or not principal.authenticated:
+def _active_account(connection, principal, now=None):
+    if (not isinstance(principal, Principal) or not isinstance(principal.session_token, str)
+            or not principal.session_token or not isinstance(principal.session_id, str)):
         raise PermissionError("Authenticated administrator required")
-    row = connection.execute("SELECT username,role,status FROM admin_accounts WHERE account_id=?",
-                             (principal.account_id,)).fetchone()
-    if not row or row[2] != "active" or row[0] != principal.username or row[1] != principal.role:
-        raise PermissionError("Account or role is no longer active")
+    row = connection.execute(
+        "SELECT a.username,a.role,a.status,a.auth_version,s.token_sha256,s.auth_version,s.expires_at_utc,s.revoked_at_utc "
+        "FROM admin_accounts a JOIN auth_sessions s ON s.account_id=a.account_id "
+        "WHERE a.account_id=? AND s.session_id=?", (principal.account_id, principal.session_id)).fetchone()
+    actual = hashlib.sha256(principal.session_token.encode("utf-8")).hexdigest()
+    current = now or datetime.now(timezone.utc)
+    if (not row or row[2] != "active" or row[0] != principal.username or row[1] != principal.role
+            or row[3] != row[5] or row[7] is not None or _parse_utc(row[6]) <= current
+            or not secrets.compare_digest(row[4], actual)):
+        raise PermissionError("Authentication credential is invalid or no longer active")
+    return row
+
+
+def _authorize(connection, principal, permission):
+    row = _active_account(connection, principal)
+    if not has_permission(row[1], permission):
+        raise PermissionError("Permission denied")
     return row
 
 
 def create_admin(path, principal, username, password, role, now=None):
-    require_permission(principal, "admin.create")
     username, password = _username(username), _password(password)
     if role not in ROLES:
         raise ValueError("Invalid role")
     connection = open_auth_database(path)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _active_account(connection, principal)
+        _authorize(connection, principal, "admin.create")
         account_id, timestamp = str(uuid.uuid4()), _utc(now)
-        connection.execute("INSERT INTO admin_accounts VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        connection.execute("INSERT INTO admin_accounts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                            (account_id, username, generate_password_hash(password, method=PASSWORD_METHOD),
-                            PASSWORD_METHOD, role, "active", timestamp, None, timestamp, 0, None))
+                            PASSWORD_METHOD, role, "active", timestamp, None, timestamp, 0, None, 1))
         _append_event(connection, "admin.create", principal.account_id, account_id, {"role": role}, now)
         connection.commit()
         return account_id
@@ -299,15 +325,16 @@ def _protect_last_admin(connection, account_id, new_role=None, disabling=False):
 
 
 def assign_role(path, principal, account_id, role, now=None):
-    require_permission(principal, "admin.assign_role")
     if role not in ROLES:
         raise ValueError("Invalid role")
     connection = open_auth_database(path)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _active_account(connection, principal)
+        _authorize(connection, principal, "admin.assign_role")
         _protect_last_admin(connection, account_id, new_role=role)
-        connection.execute("UPDATE admin_accounts SET role=? WHERE account_id=?", (role, account_id))
+        connection.execute("UPDATE admin_accounts SET role=?,auth_version=auth_version+1 WHERE account_id=?", (role, account_id))
+        connection.execute("UPDATE auth_sessions SET revoked_at_utc=? WHERE account_id=? AND revoked_at_utc IS NULL",
+                           (_utc(now), account_id))
         _append_event(connection, "admin.assign_role", principal.account_id, account_id, {"role": role}, now)
         connection.commit()
     except BaseException:
@@ -318,14 +345,15 @@ def assign_role(path, principal, account_id, role, now=None):
 
 
 def disable_admin(path, principal, account_id, now=None):
-    require_permission(principal, "admin.disable")
     connection = open_auth_database(path)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _active_account(connection, principal)
+        _authorize(connection, principal, "admin.disable")
         _protect_last_admin(connection, account_id, disabling=True)
-        if connection.execute("UPDATE admin_accounts SET status='disabled' WHERE account_id=?", (account_id,)).rowcount != 1:
+        if connection.execute("UPDATE admin_accounts SET status='disabled',auth_version=auth_version+1 WHERE account_id=?", (account_id,)).rowcount != 1:
             raise ValueError("Administrator not found")
+        connection.execute("UPDATE auth_sessions SET revoked_at_utc=? WHERE account_id=? AND revoked_at_utc IS NULL",
+                           (_utc(now), account_id))
         _append_event(connection, "admin.disable", principal.account_id, account_id, {}, now)
         connection.commit()
     except BaseException:
@@ -343,7 +371,6 @@ def change_password(path, principal, current_password, new_password, now=None):
 
 
 def reset_password(path, principal, account_id, new_password, now=None):
-    require_permission(principal, "admin.reset_password")
     _set_password(path, principal, account_id, new_password, "admin.reset_password", now)
 
 
@@ -352,13 +379,18 @@ def _set_password(path, principal, account_id, new_password, event_type, now):
     connection = open_auth_database(path)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _active_account(connection, principal)
+        if event_type == "admin.reset_password":
+            _authorize(connection, principal, "admin.reset_password")
+        else:
+            _active_account(connection, principal)
         if connection.execute(
             "UPDATE admin_accounts SET password_hash=?,password_method=?,password_changed_at_utc=?,"
-            "failed_attempts=0,locked_until_utc=NULL WHERE account_id=?",
+            "failed_attempts=0,locked_until_utc=NULL,auth_version=auth_version+1 WHERE account_id=?",
             (generate_password_hash(new_password, method=PASSWORD_METHOD), PASSWORD_METHOD, _utc(now), account_id)
         ).rowcount != 1:
             raise ValueError("Administrator not found")
+        connection.execute("UPDATE auth_sessions SET revoked_at_utc=? WHERE account_id=? AND revoked_at_utc IS NULL",
+                           (_utc(now), account_id))
         _append_event(connection, event_type, principal.account_id, account_id, {}, now)
         connection.commit()
     except BaseException:
@@ -369,10 +401,9 @@ def _set_password(path, principal, account_id, new_password, event_type, now):
 
 
 def list_admins(path, principal):
-    require_permission(principal, "audit.read")
     connection = open_auth_database(path, readonly=True)
     try:
-        _active_account(connection, principal)
+        _authorize(connection, principal, "audit.read")
         rows = connection.execute(
             "SELECT account_id,username,role,status,created_at_utc,last_login_at_utc,password_changed_at_utc "
             "FROM admin_accounts ORDER BY username COLLATE NOCASE").fetchall()
@@ -382,13 +413,13 @@ def list_admins(path, principal):
         connection.close()
 
 
-def authorized_review_decision(auth_path, principal, review_path, staging_path, **decision):
+def authorized_review_decision(auth_path, principal, review_path, staging_path,
+                               authorization_failure_hook=None, **decision):
     """Create a legacy-compatible review event plus separately verified authorization evidence."""
-    require_permission(principal, "review.decide")
     connection = open_auth_database(auth_path)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        _active_account(connection, principal)
+        _authorize(connection, principal, "review.decide")
         operation_id = decision.get("operation_id")
         # The legacy row intentionally remains self_asserted_cli. Only this independently
         # verified link upgrades the composite action's assurance.
@@ -405,6 +436,8 @@ def authorized_review_decision(auth_path, principal, review_path, staging_path, 
             return {"status": "authorized_idempotent_replay", "authorization_id": existing[0],
                     "event_id": event_id, "event_hash": event_hash,
                     "identity_assurance": IDENTITY_ASSURANCE, "formal_approval_created": False}
+        if authorization_failure_hook is not None:
+            authorization_failure_hook()
         details = {"operation_id": operation_id, "review_event_id": event_id,
                    "review_event_hash": event_hash, "permission": "review.decide",
                    "identity_assurance": IDENTITY_ASSURANCE}

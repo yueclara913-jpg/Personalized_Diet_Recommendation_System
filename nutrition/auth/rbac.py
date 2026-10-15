@@ -23,10 +23,3 @@ KNOWN_PERMISSIONS = frozenset().union(*ROLE_PERMISSIONS.values())
 def has_permission(role, permission):
     """Return False for every unknown role or permission."""
     return permission in KNOWN_PERMISSIONS and permission in ROLE_PERMISSIONS.get(role, ())
-
-
-def require_permission(principal, permission):
-    if principal is None or not getattr(principal, "authenticated", False):
-        raise PermissionError("Authenticated administrator required")
-    if not has_permission(principal.role, permission):
-        raise PermissionError("Permission denied")
