@@ -66,9 +66,13 @@ def review_database(path, policy=DEFAULT_POLICY, provenance_evidence=None):
         releases = {row[0]: row[1:] for row in release_rows}
         if set(evidence) - set(releases):
             raise ValueError("Provenance evidence references an unknown release")
-        duplicate_counts = dict(connection.execute(
-            "SELECT fdc_id,count(*) FROM staging_records GROUP BY fdc_id"
-        ).fetchall())
+        # FDC identity is release-scoped. The composite primary key normally
+        # guarantees this count is one; keep the check as defense in depth.
+        duplicate_counts = {(release_key, fdc_id): count for release_key, fdc_id, count in
+                            connection.execute(
+                                "SELECT release_key,fdc_id,count(*) FROM staging_records "
+                                "GROUP BY release_key,fdc_id"
+                            ).fetchall()}
         results = []
         for release_key, fdc_id, locator, record_json, record_sha256, anomaly_count, status in connection.execute(
                 "SELECT release_key,fdc_id,source_locator,record_json,record_sha256,anomaly_count,review_status "
@@ -86,7 +90,7 @@ def review_database(path, policy=DEFAULT_POLICY, provenance_evidence=None):
             context = {"official_file_verified": False,
                        "verified_source_file_sha256": None, "verified_source_version": None,
                        "verified_source_url": None, "verification_reference": None,
-                       "duplicate_fdc_count": duplicate_counts.get(fdc_id, 0)}
+                       "duplicate_fdc_count": duplicate_counts.get((release_key, fdc_id), 0)}
             specific = evidence.get(release_key, {})
             if not isinstance(specific, dict):
                 raise ValueError("Release provenance evidence must be an object")

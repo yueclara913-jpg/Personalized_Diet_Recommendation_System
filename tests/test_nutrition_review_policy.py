@@ -42,9 +42,10 @@ class ReviewPolicyTests(unittest.TestCase):
                         "verification_reference": "TEST_ONLY independent evidence",
                         "duplicate_fdc_count": 1}
 
-    def parse(self, food=None, basis="per_100g", evidence="TEST_ONLY basis evidence"):
+    def parse(self, food=None, basis="per_100g", evidence="TEST_ONLY basis evidence",
+              version="TEST_ONLY_v1"):
         self.raw.write_text(json.dumps({"FoundationFoods": [food or self.food]}), encoding="utf-8")
-        return parse_snapshot(self.raw, source_version="TEST_ONLY_v1",
+        return parse_snapshot(self.raw, source_version=version,
                               source_url="https://fdc.nal.usda.gov/TEST_ONLY",
                               nutrition_basis=basis, basis_evidence=evidence,
                               energy_id=1008, sugar_id=1063)
@@ -211,6 +212,25 @@ class ReviewPolicyTests(unittest.TestCase):
         evidence = {name: value for name, value in self.context.items() if name != "duplicate_fdc_count"}
         report = CLI.review_database(self.db, provenance_evidence={key: evidence})
         self.assertEqual(report["decision_counts"]["ready_for_manual_review"], 1)
+
+    def test_same_fdc_in_different_releases_is_not_duplicate(self):
+        self.import_db()
+        second = self.parse(version="TEST_ONLY_v2")
+        import_payload(second, mode="staging", database=self.db, confirm_existing=True)
+        report = CLI.review_database(self.db)
+        self.assertEqual(report["total"], 2)
+        self.assertEqual(report["decision_counts"], {
+            "ready_for_manual_review": 0, "needs_review": 2, "rejected_by_policy": 0})
+        self.assertFalse(any(issue["rule_id"] == "INT001"
+                             for result in report["results"] for issue in result["issues"]))
+
+    def test_same_release_duplicate_blocked_by_composite_primary_key(self):
+        self.import_db()
+        with sqlite3.connect(self.db) as connection:
+            row = connection.execute("SELECT * FROM staging_records").fetchone()
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("INSERT INTO staging_records VALUES (?,?,?,?,?,?,?)", row)
+            self.assertEqual(connection.execute("SELECT count(*) FROM staging_records").fetchone()[0], 1)
 
     def test_business_database_refused(self):
         spec = importlib.util.spec_from_file_location("initdb", ROOT / "scripts/init_nutrition_db.py")

@@ -18,13 +18,15 @@
 
 ## 默认策略与 33 条规则
 
-默认策略 `nutrition-review-v1` 保守要求 `calories`、`protein`、`fat`、`carbohydrates`，接受 `per_100g` 和 `Foundation`。来源真实性证据必须明确传入并同时匹配 URL、版本、原始文件 SHA-256，且具有非空证据引用；只有哈希不算官方真实性验证。
+默认策略 `nutrition-review-v1` 保守要求 `calories`、`protein`、`fat`、`carbohydrates`，接受 `per_100g` 和 `Foundation`。来源真实性标志及证据引用完全由外部调用方声明；程序只检查声明字段是否齐全并与 URL、版本、原始文件 SHA-256 一致，不会联网、验签或独立认证 USDA 来源。只有哈希不算官方真实性验证。
 
 规则分为五类：来源与治理 9 条、结构与完整性 7 条、计量基准 4 条、营养值与转换 11 条、定义冲突 2 条。规则编号稳定地写入每条 issue；同一记录按编号、位置和营养素 ID 排序，结果包含审核记录 SHA-256，重复执行输出一致。
 
 > 分类存在治理与完整性含义交叉；唯一规则编号总数为 33：SRC001—SRC007、GOV001、INT001、STR001—STR007、BAS001—BAS004、NUT001—NUT011、DEF001—DEF002。
 
 硬性拒绝包括非法 FDC/营养素 ID、重复 ID、非法食品名称或结构、来源 URL/版本/哈希/定位非法、暂存状态不是 pending、非法或超技术范围数值、未知转换状态，以及原始营养素与解析营养素无法逐项追溯。
+
+食品身份按 `(release_key, fdc_id)` 判重。同一发布版本的相同 FDC ID 由 PR #6 暂存表复合主键直接阻止，审核层仍保留 `INT001` 作为防御性规则；不同发布版本中的相同 FDC ID 是合法版本共存，不触发重复拒绝。
 
 默认人工复核包括：官方真实性证据未独立匹配、非每 100 g 或无基准依据、可能的干物质或份量换算、缺失值、未知单位、已知转换失败、LOQ 限定值、缺少策略必需营养素，以及多个能量或糖定义。真实零值不会被当作缺失；任何缺失项都不会填零或估算。
 
@@ -50,7 +52,7 @@ python scripts/review_usda_staging.py \
   --output-dir /outside/review-report-v1
 ```
 
-`--policy` 可指定策略 JSON。`--provenance-evidence` 可指定以 `release_key` 为键的证据对象；每项可包含 `official_file_verified`、`verified_source_file_sha256`、`verified_source_version`、`verified_source_url` 和 `verification_reference`。这些字段是调用方提供的审核证据，不由工具伪造；缺省时真实性未核验。
+`--policy` 可指定策略 JSON。`--provenance-evidence` 可指定以 `release_key` 为键的证据对象；每项可包含 `official_file_verified`、`verified_source_file_sha256`、`verified_source_version`、`verified_source_url` 和 `verification_reference`。这些字段只是调用方提供的外部证据声明，不由工具生成，也不表示程序已经独立认证 USDA 来源；缺省时真实性未核验。
 
 数据库必须是常规非链接文件。工具用 SQLite URI `mode=ro` 和 `query_only=ON` 打开，验证 PR #6 专用 `application_id`、`user_version`、完整 schema、外键和完整性；正式业务库、额外/缺失表及记录摘要不一致均拒绝。数据库字节不应变化。
 
