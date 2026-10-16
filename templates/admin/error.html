@@ -1,0 +1,1 @@
+{% extends 'admin/base.html' %}{% block title %}操作失败{% endblock %}{% block content %}<div class="alert"><h2>操作未完成</h2><p>{{ message }}</p><a href="{{ url_for('admin.dashboard_view') }}">返回工作台</a></div>{% endblock %}

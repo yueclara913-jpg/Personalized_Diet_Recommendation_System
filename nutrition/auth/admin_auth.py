@@ -413,6 +413,19 @@ def list_admins(path, principal):
         connection.close()
 
 
+def get_account_state(path, account_id):
+    """Return non-secret current state for server-side session validation."""
+    connection = open_auth_database(path, readonly=True)
+    try:
+        row = connection.execute(
+            "SELECT username,role,status,auth_version FROM admin_accounts WHERE account_id=?", (account_id,)).fetchone()
+        if row is None:
+            return None
+        return {"username": row[0], "role": row[1], "status": row[2], "auth_version": row[3]}
+    finally:
+        connection.close()
+
+
 def authorized_review_decision(auth_path, principal, review_path, staging_path,
                                authorization_failure_hook=None, **decision):
     """Create a legacy-compatible review event plus separately verified authorization evidence."""
