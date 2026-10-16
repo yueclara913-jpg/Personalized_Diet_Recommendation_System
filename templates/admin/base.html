@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}食品营养数据管理平台{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <h1>个性化膳食推荐系统</h1><p>食品营养数据管理平台</p>
+    <nav><a href="{{ url_for('admin.dashboard_view') }}">工作台</a><a href="{{ url_for('admin.foods') }}">食品审核</a></nav>
+    {% if principal %}<div class="identity"><b>{{ principal.username }}</b><span>{{ principal.role }}</span></div>
+    <form method="post" action="{{ url_for('admin.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button>安全退出</button></form>{% endif %}
+  </aside>
+  <main>{% with messages=get_flashed_messages() %}{% for message in messages %}<div class="notice">{{ message }}</div>{% endfor %}{% endwith %}{% block content %}{% endblock %}</main>
+</div>
+</body></html>
