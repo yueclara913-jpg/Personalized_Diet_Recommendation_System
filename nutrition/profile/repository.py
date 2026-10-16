@@ -122,8 +122,12 @@ def get_profile(path, profile_id):
         connection.close()
     if row is None:
         return None
-    return HealthProfile(row[0], row[1], row[2], row[3], row[4], row[5], row[6],
-                         tuple(json.loads(row[7])), row[8], row[9], row[10])
+    try:
+        restrictions = json.loads(row[7])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("Invalid stored health profile JSON") from error
+    return validate_profile(HealthProfile(row[0], row[1], row[2], row[3], row[4], row[5], row[6],
+                                          restrictions, row[8], row[9], row[10]))
 
 
 def update_profile(path, profile, *, expected_updated_at, now=None, failure_hook=None):

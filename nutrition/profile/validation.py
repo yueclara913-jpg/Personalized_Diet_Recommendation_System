@@ -1,7 +1,7 @@
 """Central validation for supported general-adult health profiles."""
 from dataclasses import replace
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
-import math
 import re
 
 ADULT_AGE_RANGE = (18, 100)
@@ -32,8 +32,12 @@ def finite_decimal(value, name, *, positive=False, allow_zero=True):
 
 
 def _timestamp(value, name):
-    if not isinstance(value, str) or not value.endswith("Z") or len(value) > 40:
+    if not isinstance(value, str) or len(value) > 40:
         raise ProfileValidationError(f"Invalid {name}")
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        raise ProfileValidationError(f"Invalid {name}") from None
     return value
 
 

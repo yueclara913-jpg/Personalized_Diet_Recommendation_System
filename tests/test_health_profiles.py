@@ -10,8 +10,9 @@ import unittest
 import main
 from nutrition.auth.admin_auth import APPLICATION_ID as ADMIN_APPLICATION_ID
 from nutrition.profile.calculations import (ACTIVITY_FACTORS, ManualReviewRequired,
-    calculate_bmi, calculate_bmr, calculate_daily_targets, calculate_nutrition_gaps,
-    calculate_tdee)
+    DEFAULT_MACRO_RATIOS, TARGET_APPLICABILITY_POLICY_VERSION, calculate_bmi,
+    calculate_bmr, calculate_daily_targets, calculate_nutrition_gaps, calculate_tdee,
+    validate_daily_target_applicability)
 from nutrition.profile.models import HealthProfile
 from nutrition.profile.repository import (APPLICATION_ID, get_profile, initialize_database,
                                             insert_profile, update_profile, validate_database)
@@ -250,6 +251,156 @@ class HealthProfileTests(unittest.TestCase):
 
     def test_50_invalid_equation_option_rejected(self):
         with self.assertRaises(ProfileValidationError): self.profile(sex_for_equation="other")
+
+    def extreme_profile(self, **changes):
+        values = dict(age=18, height_cm=250, weight_kg=350, activity_level="extra_active",
+                      health_goal="maintain_weight", sex_for_equation="male_parameter")
+        values.update(changes)
+        return self.profile(**values)
+
+    def assert_manual_review(self, callable_):
+        with self.assertRaises(ManualReviewRequired) as caught:
+            callable_()
+        error = caught.exception
+        self.assertEqual(error.status, "manual_review_required")
+        self.assertEqual(error.policy_version, TARGET_APPLICABILITY_POLICY_VERSION)
+        self.assertTrue(error.issues)
+        self.assertNotIn("target_energy_kcal", error.__dict__)
+        self.assertNotIn("protein_target_g", error.__dict__)
+        return error
+
+    def test_51_reported_extreme_profile_requires_manual_review(self):
+        error = self.assert_manual_review(lambda: calculate_daily_targets(self.extreme_profile()))
+        rules = {issue["rule_id"] for issue in error.issues}
+        self.assertIn("APP001_EXTREME_BMI", rules)
+        self.assertIn("APP002_TDEE_RANGE", rules)
+
+    def test_52_extremely_high_bmi_requires_manual_review(self):
+        error = self.assert_manual_review(lambda: calculate_daily_targets(
+            self.profile(height_cm=150, weight_kg=100, activity_level="sedentary")))
+        self.assertIn("APP001_EXTREME_BMI", {item["rule_id"] for item in error.issues})
+
+    def test_53_extremely_low_bmi_requires_manual_review(self):
+        error = self.assert_manual_review(lambda: calculate_daily_targets(
+            self.profile(height_cm=200, weight_kg=50, activity_level="sedentary")))
+        self.assertIn("APP001_EXTREME_BMI", {item["rule_id"] for item in error.issues})
+
+    def test_54_high_absolute_tdee_requires_manual_review(self):
+        error = self.assert_manual_review(lambda: calculate_daily_targets(self.extreme_profile()))
+        self.assertIn("APP002_TDEE_RANGE", {item["rule_id"] for item in error.issues})
+
+    def test_55_high_target_energy_requires_manual_review(self):
+        high_target = self.profile(age=18, height_cm=200, weight_kg=136,
+                                   activity_level="extra_active", health_goal="gain_weight")
+        error = self.assert_manual_review(lambda: calculate_daily_targets(high_target))
+        self.assertIn("APP003_TARGET_ENERGY_RANGE", {item["rule_id"] for item in error.issues})
+
+    def test_56_high_protein_per_kg_custom_ratio_requires_review(self):
+        ratios = {"protein": .8, "fat": .1, "carbohydrates": .1}
+        error = self.assert_manual_review(lambda: calculate_daily_targets(self.profile(), macro_ratios=ratios))
+        self.assertIn("APP005_PROTEIN_G_PER_KG", {item["rule_id"] for item in error.issues})
+
+    def test_57_unreasonable_absolute_macro_requires_review(self):
+        ratios = {"protein": .1, "fat": .8, "carbohydrates": .1}
+        error = self.assert_manual_review(lambda: calculate_daily_targets(self.profile(), macro_ratios=ratios))
+        self.assertIn("APP007_FAT_RANGE", {item["rule_id"] for item in error.issues})
+
+    def test_58_all_goals_fail_closed_for_extreme_profile(self):
+        for goal in ("maintain_weight", "lose_weight", "gain_weight"):
+            with self.subTest(goal=goal):
+                self.assert_manual_review(lambda goal=goal: calculate_daily_targets(
+                    self.extreme_profile(health_goal=goal)))
+
+    def test_59_custom_adjustment_cannot_bypass_extreme_profile(self):
+        adjustments = {"maintain_weight": -500, "lose_weight": -500, "gain_weight": -500}
+        self.assert_manual_review(lambda: calculate_daily_targets(
+            self.extreme_profile(), goal_adjustments=adjustments))
+
+    def test_60_normal_profile_calculations_remain_compatible(self):
+        item = self.profile()
+        self.assertEqual(calculate_bmi(item.weight_kg, item.height_cm)["bmi_rounded"], 22.86)
+        self.assertEqual(calculate_bmr(item)["estimated_bmr_kcal"], 1648.75)
+        self.assertEqual(calculate_tdee(item)["estimated_tdee_kcal"], 2555.56)
+        target = calculate_daily_targets(item)
+        self.assertEqual(target["target_energy_kcal"], 2555.56)
+        self.assertEqual(target["applicability_policy_version"], TARGET_APPLICABILITY_POLICY_VERSION)
+
+    def test_61_bmi_lower_safety_boundary_and_neighbor(self):
+        at_boundary = self.profile(height_cm=200, weight_kg=60)
+        result = validate_daily_target_applicability(at_boundary, 1000, 1000, DEFAULT_MACRO_RATIOS)
+        self.assertEqual(result["bmi"], 15)
+        below = self.profile(height_cm=200, weight_kg=59.99)
+        error = self.assert_manual_review(lambda: validate_daily_target_applicability(
+            below, 1000, 1000, DEFAULT_MACRO_RATIOS))
+        self.assertIn("APP001_EXTREME_BMI", {item["rule_id"] for item in error.issues})
+
+    def test_62_bmi_upper_safety_boundary_and_neighbor(self):
+        ratios = {"protein": .20, "fat": .34, "carbohydrates": .46}
+        at_boundary = self.profile(height_cm=200, weight_kg=160)
+        result = validate_daily_target_applicability(at_boundary, 2000, 2000, ratios)
+        self.assertEqual(result["bmi"], 40)
+        above = self.profile(height_cm=200, weight_kg=160.01)
+        error = self.assert_manual_review(lambda: validate_daily_target_applicability(above, 2000, 2000, ratios))
+        self.assertIn("APP001_EXTREME_BMI", {item["rule_id"] for item in error.issues})
+
+    def test_63_manual_review_exception_has_auditable_observation_only(self):
+        error = self.assert_manual_review(lambda: calculate_daily_targets(self.extreme_profile()))
+        self.assertTrue(all(set(item) == {"rule_id", "observed", "unit", "supported_minimum", "supported_maximum"}
+                            for item in error.issues))
+
+    def test_64_corrupt_restrictions_json_rejected_on_read(self):
+        initialize_database(self.db); item = self.profile(); insert_profile(self.db, item)
+        with sqlite3.connect(self.db) as db:
+            db.execute("UPDATE health_profiles SET dietary_restrictions_json='not-json'")
+        with self.assertRaises(ValueError): get_profile(self.db, item.profile_id)
+
+    def test_65_wrong_restrictions_json_type_rejected_on_read(self):
+        initialize_database(self.db); item = self.profile(); insert_profile(self.db, item)
+        with sqlite3.connect(self.db) as db:
+            db.execute("UPDATE health_profiles SET dietary_restrictions_json='{}'")
+        with self.assertRaises(ProfileValidationError): get_profile(self.db, item.profile_id)
+
+    def test_66_invalid_timestamp_rejected_on_read(self):
+        initialize_database(self.db); item = self.profile(); insert_profile(self.db, item)
+        with sqlite3.connect(self.db) as db:
+            db.execute("UPDATE health_profiles SET updated_at_utc='not-a-date'")
+        with self.assertRaises(ProfileValidationError): get_profile(self.db, item.profile_id)
+
+    def test_67_invalid_domain_field_rejected_on_read(self):
+        initialize_database(self.db); item = self.profile(); insert_profile(self.db, item)
+        with sqlite3.connect(self.db) as db:
+            db.execute("PRAGMA ignore_check_constraints=ON")
+            db.execute("UPDATE health_profiles SET activity_level='invalid'")
+        with self.assertRaises(ProfileValidationError): get_profile(self.db, item.profile_id)
+
+    def test_68_energy_safety_boundaries_are_closed_intervals(self):
+        item = self.profile()
+        validate_daily_target_applicability(item, 1000, 1000, DEFAULT_MACRO_RATIOS)
+        low = self.assert_manual_review(lambda: validate_daily_target_applicability(
+            item, 999.99, 999.99, DEFAULT_MACRO_RATIOS))
+        self.assertIn("APP002_TDEE_RANGE", {issue["rule_id"] for issue in low.issues})
+        ratios = {"protein": .20, "fat": .34, "carbohydrates": .46}
+        heavier = self.profile(weight_kg=100)
+        validate_daily_target_applicability(heavier, 5000, 5000, ratios)
+        high = self.assert_manual_review(lambda: validate_daily_target_applicability(
+            heavier, 5000.01, 5000.01, ratios))
+        self.assertIn("APP002_TDEE_RANGE", {issue["rule_id"] for issue in high.issues})
+        self.assertIn("APP003_TARGET_ENERGY_RANGE", {issue["rule_id"] for issue in high.issues})
+
+    def test_69_protein_per_kg_boundary_and_neighbor(self):
+        item = self.profile()
+        validate_daily_target_applicability(item, 3360, 3360, DEFAULT_MACRO_RATIOS)
+        error = self.assert_manual_review(lambda: validate_daily_target_applicability(
+            item, 3360.01, 3360.01, DEFAULT_MACRO_RATIOS))
+        self.assertIn("APP005_PROTEIN_G_PER_KG", {issue["rule_id"] for issue in error.issues})
+
+    def test_70_absolute_macro_boundary_and_neighbor(self):
+        ratios = {"protein": .10, "fat": .80, "carbohydrates": .10}
+        item = self.profile()
+        validate_daily_target_applicability(item, 2250, 2250, ratios)
+        error = self.assert_manual_review(lambda: validate_daily_target_applicability(
+            item, 2250.01, 2250.01, ratios))
+        self.assertIn("APP007_FAT_RANGE", {issue["rule_id"] for issue in error.issues})
 
 
 if __name__ == "__main__":

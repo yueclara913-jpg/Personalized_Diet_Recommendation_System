@@ -1,4 +1,5 @@
 """Explainable estimates for generally healthy adults; never medical diagnosis."""
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 
 from .validation import ProfileValidationError, finite_decimal, require_general_adult
@@ -7,6 +8,7 @@ BMI_FORMULA_VERSION = "bmi_metric_v1"
 BMI_CLASSIFICATION_VERSION = "who_adult_reference_v1"
 BMR_FORMULA_VERSION = "mifflin_st_jeor_adult_v1"
 TARGET_POLICY_VERSION = "general_adult_energy_policy_v1"
+TARGET_APPLICABILITY_POLICY_VERSION = "general_adult_target_applicability_v1"
 MACRO_POLICY_VERSION = "energy_ratio_4_4_9_v1"
 GAP_VERSION = "nutrition_gap_v1"
 
@@ -28,8 +30,38 @@ NUTRIENT_FIELDS = {"energy": ("target_energy_kcal", "kcal"),
                    "carbohydrates": ("carbohydrate_target_g", "g")}
 
 
+@dataclass(frozen=True)
+class TargetApplicabilityPolicy:
+    version: str = TARGET_APPLICABILITY_POLICY_VERSION
+    minimum_bmi: Decimal = Decimal("15")
+    maximum_bmi: Decimal = Decimal("40")
+    minimum_tdee_kcal: Decimal = Decimal("1000")
+    maximum_tdee_kcal: Decimal = Decimal("5000")
+    minimum_target_energy_kcal: Decimal = Decimal("1000")
+    maximum_target_energy_kcal: Decimal = Decimal("5000")
+    minimum_target_to_tdee_ratio: Decimal = Decimal("0.80")
+    maximum_target_to_tdee_ratio: Decimal = Decimal("1.20")
+    minimum_protein_g_per_kg: Decimal = Decimal("0.60")
+    maximum_protein_g_per_kg: Decimal = Decimal("3.00")
+    minimum_protein_g: Decimal = Decimal("30")
+    maximum_protein_g: Decimal = Decimal("250")
+    minimum_fat_g: Decimal = Decimal("20")
+    maximum_fat_g: Decimal = Decimal("200")
+    minimum_carbohydrate_g: Decimal = Decimal("50")
+    maximum_carbohydrate_g: Decimal = Decimal("600")
+
+
+DEFAULT_TARGET_APPLICABILITY_POLICY = TargetApplicabilityPolicy()
+
+
 class ManualReviewRequired(ValueError):
-    pass
+    """Fail-closed result with audit details but no usable nutrition targets."""
+
+    def __init__(self, message, *, policy_version=None, issues=None):
+        super().__init__(message)
+        self.status = "manual_review_required"
+        self.policy_version = policy_version
+        self.issues = tuple(issues or ())
 
 
 def _rounded(value, places="0.01"):
@@ -83,6 +115,51 @@ def _ratios(values):
     return result
 
 
+def _outside(value, minimum, maximum):
+    return value < minimum or value > maximum
+
+
+def validate_daily_target_applicability(profile, estimated_tdee_kcal, target_energy_kcal,
+                                        macro_ratios, policy=DEFAULT_TARGET_APPLICABILITY_POLICY):
+    """Reject candidates outside conservative engineering automation limits."""
+    item = require_general_adult(profile)
+    if not isinstance(policy, TargetApplicabilityPolicy):
+        raise TypeError("policy must be TargetApplicabilityPolicy")
+    tdee = finite_decimal(estimated_tdee_kcal, "estimated_tdee_kcal", positive=True)
+    target = finite_decimal(target_energy_kcal, "target_energy_kcal", positive=True)
+    ratios = _ratios(macro_ratios)
+    bmi = Decimal(str(calculate_bmi(item.weight_kg, item.height_cm)["bmi_raw"]))
+    grams = {key: target * ratio / ENERGY_PER_GRAM[key] for key, ratio in ratios.items()}
+    protein_per_kg = grams["protein"] / Decimal(str(item.weight_kg))
+    target_to_tdee = target / tdee
+    issues = []
+
+    def check(rule_id, value, minimum, maximum, unit):
+        if _outside(value, minimum, maximum):
+            issues.append({"rule_id": rule_id, "observed": float(value), "unit": unit,
+                           "supported_minimum": float(minimum), "supported_maximum": float(maximum)})
+
+    check("APP001_EXTREME_BMI", bmi, policy.minimum_bmi, policy.maximum_bmi, "kg/m2")
+    check("APP002_TDEE_RANGE", tdee, policy.minimum_tdee_kcal, policy.maximum_tdee_kcal, "kcal/day")
+    check("APP003_TARGET_ENERGY_RANGE", target, policy.minimum_target_energy_kcal,
+          policy.maximum_target_energy_kcal, "kcal/day")
+    check("APP004_TARGET_TDEE_RATIO", target_to_tdee, policy.minimum_target_to_tdee_ratio,
+          policy.maximum_target_to_tdee_ratio, "ratio")
+    check("APP005_PROTEIN_G_PER_KG", protein_per_kg, policy.minimum_protein_g_per_kg,
+          policy.maximum_protein_g_per_kg, "g/kg/day")
+    check("APP006_PROTEIN_RANGE", grams["protein"], policy.minimum_protein_g,
+          policy.maximum_protein_g, "g/day")
+    check("APP007_FAT_RANGE", grams["fat"], policy.minimum_fat_g, policy.maximum_fat_g, "g/day")
+    check("APP008_CARBOHYDRATE_RANGE", grams["carbohydrates"], policy.minimum_carbohydrate_g,
+          policy.maximum_carbohydrate_g, "g/day")
+    if issues:
+        raise ManualReviewRequired(
+            "Candidate daily targets are outside the supported automatic-calculation envelope",
+            policy_version=policy.version, issues=issues)
+    return {"bmi": bmi, "target_to_tdee_ratio": target_to_tdee,
+            "protein_g_per_kg": protein_per_kg, "grams": grams}
+
+
 def calculate_daily_targets(profile, *, macro_ratios=None, goal_adjustments=None):
     item = require_general_adult(profile)
     tdee = calculate_tdee(item)
@@ -95,10 +172,10 @@ def calculate_daily_targets(profile, *, macro_ratios=None, goal_adjustments=None
     adjustment = adjustments[item.health_goal]
     raw_tdee = Decimal(str(tdee["raw_tdee_kcal"]))
     target = raw_tdee + adjustment
-    if target <= 0 or target < raw_tdee * Decimal("0.80") or target > raw_tdee * Decimal("1.20"):
-        raise ManualReviewRequired("Energy target requires individual professional review")
     ratios = _ratios(DEFAULT_MACRO_RATIOS if macro_ratios is None else macro_ratios)
-    grams = {key: target * ratio / ENERGY_PER_GRAM[key] for key, ratio in ratios.items()}
+    applicability = validate_daily_target_applicability(
+        item, raw_tdee, target, ratios, DEFAULT_TARGET_APPLICABILITY_POLICY)
+    grams = applicability["grams"]
     return {"estimated_bmr_kcal": tdee["estimated_bmr_kcal"],
             "estimated_tdee_kcal": tdee["estimated_tdee_kcal"],
             "goal_adjustment_kcal": float(adjustment), "target_energy_kcal": _rounded(target),
@@ -106,6 +183,7 @@ def calculate_daily_targets(profile, *, macro_ratios=None, goal_adjustments=None
             "carbohydrate_target_g": _rounded(grams["carbohydrates"]),
             "macro_energy_ratios": {key: float(value) for key, value in ratios.items()},
             "activity_factor": tdee["activity_factor"], "formula_version": TARGET_POLICY_VERSION,
+            "applicability_policy_version": DEFAULT_TARGET_APPLICABILITY_POLICY.version,
             "bmr_formula_version": BMR_FORMULA_VERSION, "macro_formula_version": MACRO_POLICY_VERSION,
             "target_status": "estimated_general_adult_reference",
             "assumptions": ["Generally healthy adult", "Stable metric inputs", "4-4-9 macro conversion"],
