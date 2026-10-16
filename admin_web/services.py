@@ -5,10 +5,11 @@ import sqlite3
 
 from nutrition.review.policy import DEFAULT_POLICY
 from nutrition.review.workflow import evaluate_staging_subject, history
-from scripts.review_usda_staging import open_staging_readonly
+from scripts.review_usda_staging import open_staging_readonly, review_database
 
 MAX_SEARCH = 100
 PAGE_SIZE = 20
+DASHBOARD_STATISTICS_LIMIT = 5000
 
 
 def configured(path):
@@ -92,19 +93,21 @@ def food_detail(staging_path, review_path, release_key, fdc_id):
 def dashboard(staging_path, review_path):
     if not configured(staging_path):
         return {"configured": False}
-    listing = list_foods(staging_path, review_path, page=1)
     connection = open_staging_readonly(staging_path)
     try:
         total = connection.execute("SELECT count(*) FROM staging_records").fetchone()[0]
-        keys = connection.execute("SELECT release_key,fdc_id FROM staging_records ORDER BY release_key,fdc_id").fetchall()
     finally:
         connection.close()
-    counts = {"ready_for_manual_review": 0, "needs_review": 0, "rejected_by_policy": 0}
-    # Exact full-dataset counts are only computed for bounded prototype datasets.
-    exact = total <= 5000
+    # The complete scanner reuses one validated, read-only connection.  Never
+    # enumerate identities or evaluate records until the count proves bounded.
+    exact = total <= DASHBOARD_STATISTICS_LIMIT
     if exact:
-        for release_key, fdc_id in keys:
-            counts[evaluate_staging_subject(staging_path, release_key, fdc_id)["evaluation"]["decision"]] += 1
+        counts = review_database(staging_path)["decision_counts"]
+        statistics_status = "computed"
+    else:
+        counts = {"ready_for_manual_review": None, "needs_review": None,
+                  "rejected_by_policy": None}
+        statistics_status = "skipped_limit"
     handled, recent = 0, []
     if configured(review_path):
         try:
@@ -118,4 +121,6 @@ def dashboard(staging_path, review_path):
         finally:
             if "connection" in locals(): connection.close()
     return {"configured": True, "total": total, "pending": total, "counts": counts,
-            "counts_exact": exact, "handled": handled, "recent": recent, "preview": listing["items"][:5]}
+            "counts_exact": exact, "statistics_status": statistics_status,
+            "statistics_limit": DASHBOARD_STATISTICS_LIMIT,
+            "handled": handled, "recent": recent}

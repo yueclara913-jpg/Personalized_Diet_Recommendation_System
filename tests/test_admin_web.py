@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from admin_web import create_app
 from admin_web import sessions
+from admin_web import services
 from nutrition.auth.admin_auth import (assign_role, authenticate, bootstrap_admin, change_password,
                                         create_admin, disable_admin, initialize_auth_database,
                                         verify_authorized_review_action)
@@ -337,6 +338,7 @@ class AdminWebTests(unittest.TestCase):
         with sqlite3.connect(self.staging) as db: db.execute("DELETE FROM staging_records")
         self.login(); body = self.client.get("/admin/dashboard").get_data(as_text=True)
         self.assertIn(">0<", body)
+        self.assertNotIn("数据量超过统计上限", body)
 
     def test_53_needs_review_acceptance_requires_all_resolutions(self):
         self.login(); data = self.decision_data("accept_candidate")
@@ -381,6 +383,70 @@ class AdminWebTests(unittest.TestCase):
     def test_57_oversized_release_key_is_rejected(self):
         self.login()
         self.assertEqual(self.client.get("/admin/foods/" + "x" * 129 + "/91").status_code, 404)
+
+    def _dashboard_count_connection(self, total):
+        class CountCursor:
+            def fetchone(self):
+                return (total,)
+
+        class CountOnlyConnection:
+            def __init__(self):
+                self.statements = []
+                self.closed = False
+
+            def execute(self, statement, parameters=()):
+                self.statements.append((statement, parameters))
+                if statement.strip().lower() == "select count(*) from staging_records":
+                    return CountCursor()
+                raise AssertionError("dashboard performed an unbounded staging query")
+
+            def close(self):
+                self.closed = True
+
+        return CountOnlyConnection()
+
+    def test_58_dashboard_5000_boundary_computes_exact_counts(self):
+        connection = self._dashboard_count_connection(5000)
+        report = {"decision_counts": {"ready_for_manual_review": 1200,
+                  "needs_review": 3700, "rejected_by_policy": 100}}
+        with patch("admin_web.services.open_staging_readonly", return_value=connection), \
+                patch("admin_web.services.review_database", return_value=report) as scanner:
+            model = services.dashboard(self.staging, None)
+        scanner.assert_called_once_with(self.staging)
+        self.assertTrue(connection.closed)
+        self.assertTrue(model["counts_exact"])
+        self.assertEqual(model["statistics_status"], "computed")
+        self.assertEqual(model["counts"], report["decision_counts"])
+
+    def test_59_dashboard_5001_boundary_never_enumerates_or_evaluates(self):
+        for total in (5001, 1_000_000):
+            with self.subTest(total=total):
+                connection = self._dashboard_count_connection(total)
+                with patch("admin_web.services.open_staging_readonly", return_value=connection), \
+                        patch("admin_web.services.review_database") as scanner, \
+                        patch("admin_web.services.evaluate_staging_subject") as evaluator:
+                    model = services.dashboard(self.staging, None)
+                scanner.assert_not_called()
+                evaluator.assert_not_called()
+                self.assertEqual(connection.statements,
+                                 [("SELECT count(*) FROM staging_records", ())])
+                self.assertTrue(connection.closed)
+                self.assertFalse(model["counts_exact"])
+                self.assertEqual(model["statistics_status"], "skipped_limit")
+                self.assertTrue(all(value is None for value in model["counts"].values()))
+
+    def test_60_dashboard_large_dataset_message_is_unambiguous(self):
+        self.login()
+        model = {"configured": True, "total": 5001, "pending": 5001,
+                 "counts": {"ready_for_manual_review": None, "needs_review": None,
+                            "rejected_by_policy": None},
+                 "counts_exact": False, "statistics_status": "skipped_limit",
+                 "statistics_limit": 5000, "handled": 0, "recent": []}
+        with patch("admin_web.routes.dashboard", return_value=model):
+            body = self.client.get("/admin/dashboard").get_data(as_text=True)
+        self.assertEqual(body.count("<b>待计算</b>"), 3)
+        self.assertIn("数据量超过统计上限（5000 条）", body)
+        self.assertIn("不表示数量为零", body)
 
 
 if __name__ == "__main__":
